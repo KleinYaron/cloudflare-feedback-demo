@@ -6,3 +6,6 @@ compatibility_date = "2026-01-14"
 binding = "db_binding"
 database_name = "feedback-db"
 database_id = "13b27590-9e95-401c-aea4-ee020d0c7f75"
+
+[ai]
+binding = "AI"

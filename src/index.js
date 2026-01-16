@@ -1,108 +1,449 @@
+// AI Helper Functions
+async function classifyActionable(env, feedbackText) {
+  const response = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+    messages: [{
+      role: 'system',
+      content: `You are a feedback filter for a product management tool. Your job is to determine if customer feedback is actionable.
+
+ACTIONABLE feedback (return "1"):
+- Bug reports or issues with the product
+- Feature requests or suggestions
+- Performance complaints
+- Usability problems
+- Pricing concerns or objections
+- Integration or compatibility issues
+- Any feedback that a product team could act upon
+
+NOT ACTIONABLE - noise (return "0"):
+- Generic thank-yous or praise without specifics (e.g., "Great product!", "Thanks!")
+- Very short messages with no substance (less than 20 characters)
+- Messages that are just pleasantries
+- Spam or irrelevant content
+
+Return ONLY "1" for actionable or "0" for noise. No explanation.`
+    }, {
+      role: 'user',
+      content: `Classify this feedback:\n\n"${feedbackText}"`
+    }]
+  });
+
+  const result = response.response.trim();
+  return result.includes('1') ? 1 : 0;
+}
+
+async function classifyAggregatedFeedback(env, feedbackText, existingAggregatedFeedbacks) {
+  const aggregatedListText = existingAggregatedFeedbacks.length > 0
+    ? existingAggregatedFeedbacks.map(af =>
+        `ID: ${af.aggregate_id} | Aggregated Feedback: "${af.aggregate_text}"`
+      ).join('\n')
+    : 'No existing aggregated feedbacks yet.';
+
+  const response = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
+    messages: [{
+      role: 'system',
+      content: `You are a product feedback aggregator. Your job is to group similar customer feedback into clear, actionable aggregated feedback items for product managers.
+
+IMPORTANT: A single feedback can relate to MULTIPLE aggregated feedbacks if it mentions multiple issues/requests.
+
+AGGREGATED FEEDBACK should be:
+- A concise statement of the product issue or request (max 12 words)
+- Clear and specific enough for a PM to understand the problem
+- Focused on ONE core issue or theme
+- Written from the product perspective (e.g., "Export functionality fails with large datasets" not "Users complaining about exports")
+
+EXISTING AGGREGATED FEEDBACKS:
+${aggregatedListText}
+
+YOUR TASK:
+1. Read the new feedback carefully
+2. Identify ALL relevant aggregated feedbacks that this feedback relates to
+3. For each match, include its ID number
+4. If the feedback mentions issues not covered by existing aggregated feedbacks, create NEW ones
+
+RETURN FORMAT:
+- If matching existing: List the IDs separated by commas (e.g., "3,7,12")
+- If creating new: Use "NEW: <text>" for each new one, separated by semicolons
+- You can mix both: "3,7;NEW: Mobile app crashes on login"
+
+MATCHING GUIDELINES:
+- Match if the core issue/request is the same, even if wording differs
+- Don't match if it's a different feature, different bug, or different concern
+- A feedback about "slow performance and crashes" should match BOTH performance AND crash aggregated feedbacks
+- When in doubt about creating new, create it
+
+Examples:
+- "The app is slow and crashes frequently" → might return "5,8" (if 5=performance, 8=crashes)
+- "Need dark mode" → might return "NEW: Add dark mode feature"
+- "Export fails and UI is confusing" → might return "3;NEW: Improve UI clarity" (if 3=export issues exists)
+
+Return ONLY the IDs and/or NEW items. No explanations.`
+    }, {
+      role: 'user',
+      content: `New feedback to classify:\n\n"${feedbackText}"`
+    }]
+  });
+
+  const result = response.response.trim();
+  const classifications = [];
+
+  // Parse the response - could be mixed format like "3,7;NEW: Something"
+  const parts = result.split(';');
+
+  for (const part of parts) {
+    const trimmedPart = part.trim();
+
+    if (trimmedPart.startsWith('NEW:')) {
+      // Extract new aggregated feedback text
+      const aggregatedText = trimmedPart.replace('NEW:', '').trim();
+      const wordCount = aggregatedText.split(/\s+/).length;
+
+      classifications.push({
+        isNew: true,
+        aggregatedText: wordCount > 12
+          ? aggregatedText.split(/\s+/).slice(0, 12).join(' ')
+          : aggregatedText
+      });
+    } else {
+      // Parse existing IDs (could be comma-separated like "3,7,12")
+      const ids = trimmedPart.split(',').map(id => id.trim()).filter(id => id);
+      for (const idStr of ids) {
+        const idMatch = idStr.match(/\d+/);
+        if (idMatch) {
+          classifications.push({
+            isNew: false,
+            aggregateId: parseInt(idMatch[0])
+          });
+        }
+      }
+    }
+  }
+
+  // Fallback if AI returns nothing useful
+  if (classifications.length === 0) {
+    classifications.push({
+      isNew: true,
+      aggregatedText: 'Uncategorized feedback'
+    });
+  }
+
+  return classifications;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
 
-    // API: return aggregated themes table
-    if (url.pathname === "/api/table") {
-      const start = url.searchParams.get("start") || "2026-01-10";
-      const end = url.searchParams.get("end") || "2026-01-14";
+    // API: Ingest new feedback
+    if (url.pathname === "/api/ingest" && request.method === "POST") {
+      const body = await request.json().catch(() => ({}));
 
-      // Aggregate by theme by reading feedback rows and their themes_json
-      const rows = await env.db_binding
-        .prepare(
-          `SELECT id, created_at, source, text, is_actionable, themes_json, reach, impact_usd
-           FROM feedback
-           WHERE created_at >= ? AND created_at <= ?`
-        )
-        .bind(start, end)
-        .all();
+      const { text, source, contract_value } = body;
 
-      const feedbackItems = rows.results || [];
-
-      // Build theme aggregates in JS (simple + transparent for demo)
-      const agg = {};
-
-      for (const item of feedbackItems) {
-        const isActionable = Number(item.is_actionable ?? 1) === 1;
-        if (!isActionable) continue;
-
-        let themes = [];
-        try {
-          themes = JSON.parse(item.themes_json || "[]");
-        } catch {
-          themes = [];
-        }
-
-        if (themes.length === 0) themes = ["Uncategorized"];
-
-        for (const t of themes) {
-          if (!agg[t]) agg[t] = { theme: t, items: 0, reach: 0, impact_usd: 0 };
-          agg[t].items += 1;
-          agg[t].reach += Number(item.reach || 0);
-          agg[t].impact_usd += Number(item.impact_usd || 0);
-        }
+      if (!text || !source) {
+        return new Response(JSON.stringify({ error: "Missing required fields: text, source" }), {
+          status: 400,
+          headers: { "content-type": "application/json" }
+        });
       }
 
-      const table = Object.values(agg).sort((a, b) => b.impact_usd - a.impact_usd);
+      const validSources = ['CS', 'GitHub', 'X', 'Discord', 'Email'];
+      if (!validSources.includes(source)) {
+        return new Response(JSON.stringify({ error: "Invalid source. Must be: " + validSources.join(', ') }), {
+          status: 400,
+          headers: { "content-type": "application/json" }
+        });
+      }
 
-      return new Response(JSON.stringify({ start, end, total_items: feedbackItems.length, table }, null, 2), {
-        headers: { "content-type": "application/json; charset=utf-8" },
+      const timestamp = new Date().toISOString();
+
+      const result = await env.db_binding
+        .prepare(
+          `INSERT INTO feedback_events (text, timestamp, source, contract_value, is_actionable)
+           VALUES (?, ?, ?, ?, NULL)`
+        )
+        .bind(text, timestamp, source, contract_value || null)
+        .run();
+
+      return new Response(JSON.stringify({
+        success: true,
+        id: result.meta.last_row_id,
+        timestamp
+      }), {
+        headers: { "content-type": "application/json" }
       });
     }
 
-    // API: "Process with AI" (for now: simulated classification)
+    // API: Return aggregated table
+    if (url.pathname === "/api/table") {
+      const start = url.searchParams.get("start") || "2026-01-01";
+      const end = url.searchParams.get("end") || "2026-01-16";
+
+      // Get aggregated themes with their matched feedback (filtered by timeframe and actionable)
+      // Also calculate impact score based on contract value tiers
+      const aggregates = await env.db_binding
+        .prepare(
+          `SELECT
+            fa.aggregate_id,
+            fa.aggregate_text,
+            COUNT(DISTINCT fe.id) as reach_total,
+            SUM(COALESCE(fe.contract_value, 0)) as total_contract_value,
+            MAX(
+              CASE
+                WHEN fe.contract_value >= 100000 THEN 5.0
+                WHEN fe.contract_value >= 50000 THEN 4.0
+                WHEN fe.contract_value >= 10000 THEN 3.0
+                WHEN fe.contract_value >= 2500 THEN 2.0
+                ELSE 1.0
+              END
+            ) as impact_score
+           FROM feedback_aggregated fa
+           INNER JOIN feedback_match fm ON fa.aggregate_id = fm.aggregate_id
+           INNER JOIN feedback_events fe ON fm.feedback_id = fe.id
+           WHERE fe.timestamp >= ?
+             AND fe.timestamp <= ?
+             AND fe.is_actionable = 1
+           GROUP BY fa.aggregate_id, fa.aggregate_text
+           ORDER BY impact_score DESC, reach_total DESC`
+        )
+        .bind(start, end + 'T23:59:59Z')
+        .all();
+
+      // Get reach breakdown by source and distinct feedbacks for each aggregate
+      const aggregatesWithSources = [];
+      for (const agg of aggregates.results || []) {
+        const sourceBreakdown = await env.db_binding
+          .prepare(
+            `SELECT
+              fe.source,
+              COUNT(DISTINCT fe.id) as count
+             FROM feedback_match fm
+             INNER JOIN feedback_events fe ON fm.feedback_id = fe.id
+             WHERE fm.aggregate_id = ?
+               AND fe.timestamp >= ?
+               AND fe.timestamp <= ?
+               AND fe.is_actionable = 1
+             GROUP BY fe.source`
+          )
+          .bind(agg.aggregate_id, start, end + 'T23:59:59Z')
+          .all();
+
+        const reach_by_source = {};
+        for (const src of sourceBreakdown.results || []) {
+          reach_by_source[src.source] = src.count;
+        }
+
+        // Get distinct feedbacks for this aggregate
+        const distinctFeedbacks = await env.db_binding
+          .prepare(
+            `SELECT
+              fe.id,
+              fe.text,
+              fe.source,
+              fe.contract_value,
+              fe.timestamp
+             FROM feedback_match fm
+             INNER JOIN feedback_events fe ON fm.feedback_id = fe.id
+             WHERE fm.aggregate_id = ?
+               AND fe.timestamp >= ?
+               AND fe.timestamp <= ?
+               AND fe.is_actionable = 1
+             ORDER BY fe.timestamp DESC`
+          )
+          .bind(agg.aggregate_id, start, end + 'T23:59:59Z')
+          .all();
+
+        aggregatesWithSources.push({
+          aggregate_id: agg.aggregate_id,
+          aggregate_text: agg.aggregate_text,
+          reach_total: agg.reach_total,
+          reach_by_source: reach_by_source,
+          impact_score: agg.impact_score,
+          total_contract_value: agg.total_contract_value,
+          distinct_feedbacks: distinctFeedbacks.results || []
+        });
+      }
+
+      // Get excluded count for the timeframe
+      const excludedResult = await env.db_binding
+        .prepare(
+          `SELECT COUNT(*) as excluded_count
+           FROM feedback_events
+           WHERE timestamp >= ?
+             AND timestamp <= ?
+             AND is_actionable = 0`
+        )
+        .bind(start, end + 'T23:59:59Z')
+        .first();
+
+      return new Response(JSON.stringify({
+        start,
+        end,
+        excluded_count: excludedResult.excluded_count || 0,
+        table: aggregatesWithSources
+      }, null, 2), {
+        headers: { "content-type": "application/json; charset=utf-8" }
+      });
+    }
+
+    // API: Get processing status
+    if (url.pathname === "/api/status") {
+      // Check if there are any unprocessed items
+      const unprocessed = await env.db_binding
+        .prepare(`SELECT COUNT(*) as count FROM feedback_events WHERE is_actionable IS NULL`)
+        .first();
+
+      // Get last processed time from KV (we'll store this during processing)
+      const lastProcessed = await env.db_binding
+        .prepare(`SELECT MAX(timestamp) as last_time FROM feedback_events WHERE is_actionable IS NOT NULL`)
+        .first();
+
+      return new Response(JSON.stringify({
+        unprocessed_count: unprocessed.count || 0,
+        last_processed: lastProcessed.last_time || null
+      }), {
+        headers: { "content-type": "application/json" }
+      });
+    }
+
+    // API: Process with AI
     if (url.pathname === "/api/process" && request.method === "POST") {
       const body = await request.json().catch(() => ({}));
-      const start = body.start || "2026-01-10";
-      const end = body.end || "2026-01-14";
+      const start = body.start || "2026-01-01";
+      const end = body.end || "2026-01-16";
 
+      // Check if there are any new feedbacks first
+      const countResult = await env.db_binding
+        .prepare(
+          `SELECT COUNT(*) as count
+           FROM feedback_events
+           WHERE timestamp >= ? AND timestamp <= ?
+           AND is_actionable IS NULL`
+        )
+        .bind(start, end + 'T23:59:59Z')
+        .first();
+
+      if (countResult.count === 0) {
+        return new Response(JSON.stringify({
+          start,
+          end,
+          processed: 0,
+          excluded: 0,
+          new_themes: 0,
+          matched_themes: 0,
+          message: 'No new feedbacks to process'
+        }), {
+          headers: { "content-type": "application/json; charset=utf-8" }
+        });
+      }
+
+      // Get unprocessed feedback
       const rows = await env.db_binding
         .prepare(
           `SELECT id, text
-           FROM feedback
-           WHERE created_at >= ? AND created_at <= ?`
+           FROM feedback_events
+           WHERE timestamp >= ? AND timestamp <= ?
+           AND is_actionable IS NULL`
         )
-        .bind(start, end)
+        .bind(start, end + 'T23:59:59Z')
         .all();
 
       const items = rows.results || [];
-
       let processed = 0;
       let excluded = 0;
+      let newAggregatedFeedbacks = 0;
+      let matchedAggregatedFeedbacks = 0;
 
-      // Simple rules to simulate AI: noise vs themes
+      // Get all existing aggregated feedbacks for matching
+      const existingAggregatedFeedbacks = await env.db_binding
+        .prepare(`SELECT aggregate_id, aggregate_text FROM feedback_aggregated`)
+        .all();
+
+      const aggregatedFeedbackMap = new Map();
+      for (const af of existingAggregatedFeedbacks.results || []) {
+        aggregatedFeedbackMap.set(af.aggregate_text.toLowerCase(), af.aggregate_id);
+      }
+
+      // Process each feedback item
       for (const item of items) {
-        const text = String(item.text || "").toLowerCase();
+        const text = String(item.text || "");
 
-        let is_actionable = 1;
-        let themes = [];
-
-        // noise examples
-        if (text.includes("thanks") || text.includes("great") || text.length < 12) {
-          is_actionable = 0;
-        }
+        // STEP A: Determine if actionable using AI
+        const is_actionable = await classifyActionable(env, text);
 
         if (is_actionable === 0) {
           excluded += 1;
-        } else {
-          if (text.includes("crash") || text.includes("bug") || text.includes("does not work")) themes.push("Bug");
-          if (text.includes("slow") || text.includes("performance")) themes.push("Performance");
-          if (text.includes("expensive") || text.includes("price") || text.includes("pricing")) themes.push("Pricing");
-          if (text.includes("signup") || text.includes("onboarding")) themes.push("Onboarding");
-          if (text.includes("add") || text.includes("feature") || text.includes("export")) themes.push("Feature request");
-          if (themes.length === 0) themes.push("Uncategorized");
+        }
+
+        // Update is_actionable flag
+        await env.db_binding
+          .prepare(`UPDATE feedback_events SET is_actionable = ? WHERE id = ?`)
+          .bind(is_actionable, item.id)
+          .run();
+
+        // STEP B: Classify into aggregated feedback(s) - can be multiple!
+        if (is_actionable === 1) {
+          const classifications = await classifyAggregatedFeedback(
+            env,
+            text,
+            existingAggregatedFeedbacks.results || []
+          );
+
+          // Process EACH classification (many-to-many support)
+          for (const classification of classifications) {
+            let aggregateId;
+
+            if (classification.isNew) {
+              // Check if we already created this in current batch
+              const existingMatch = aggregatedFeedbackMap.get(
+                classification.aggregatedText.toLowerCase()
+              );
+
+              if (existingMatch) {
+                aggregateId = existingMatch;
+                matchedAggregatedFeedbacks += 1;
+              } else {
+                // Create new aggregated feedback
+                const insertResult = await env.db_binding
+                  .prepare(`INSERT INTO feedback_aggregated (aggregate_text) VALUES (?)`)
+                  .bind(classification.aggregatedText)
+                  .run();
+
+                aggregateId = insertResult.meta.last_row_id;
+                aggregatedFeedbackMap.set(classification.aggregatedText.toLowerCase(), aggregateId);
+
+                // Add to existing list for subsequent classifications
+                existingAggregatedFeedbacks.results.push({
+                  aggregate_id: aggregateId,
+                  aggregate_text: classification.aggregatedText
+                });
+
+                newAggregatedFeedbacks += 1;
+              }
+            } else {
+              aggregateId = classification.aggregateId;
+              matchedAggregatedFeedbacks += 1;
+            }
+
+            // Create match in feedback_match table (many-to-many!)
+            await env.db_binding
+              .prepare(`INSERT OR IGNORE INTO feedback_match (aggregate_id, feedback_id) VALUES (?, ?)`)
+              .bind(aggregateId, item.id)
+              .run();
+          }
 
           processed += 1;
         }
-
-        await env.db_binding
-          .prepare(`UPDATE feedback SET is_actionable = ?, themes_json = ? WHERE id = ?`)
-          .bind(is_actionable, JSON.stringify(themes), item.id)
-          .run();
       }
 
-      return new Response(JSON.stringify({ start, end, processed, excluded }, null, 2), {
-        headers: { "content-type": "application/json; charset=utf-8" },
+      return new Response(JSON.stringify({
+        start,
+        end,
+        processed,
+        excluded,
+        new_themes: newAggregatedFeedbacks,
+        matched_themes: matchedAggregatedFeedbacks
+      }, null, 2), {
+        headers: { "content-type": "application/json; charset=utf-8" }
       });
     }
 
@@ -112,7 +453,7 @@ export default {
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>Feedback Demo</title>
+  <title>Feedback Consolidation</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -123,7 +464,7 @@ export default {
       min-height: 100vh;
     }
     .container {
-      max-width: 900px;
+      max-width: 1400px;
       margin: 0 auto;
       padding: 40px 24px;
     }
@@ -149,6 +490,7 @@ export default {
       box-shadow: 0 10px 40px rgba(0,0,0,0.15);
       padding: 28px;
       margin-bottom: 24px;
+      overflow: visible;
     }
     .controls {
       display: flex;
@@ -220,8 +562,19 @@ export default {
     .btn-primary:active {
       transform: translateY(0);
     }
+    .last-processed {
+      margin-top: 16px;
+      padding: 12px 0;
+      font-size: 13px;
+      color: #64748b;
+      border-top: 1px solid #f1f5f9;
+    }
+    .last-processed span {
+      font-weight: 600;
+      color: #334155;
+    }
     .status {
-      margin-top: 20px;
+      margin-top: 16px;
       padding: 14px 18px;
       border-radius: 10px;
       font-size: 14px;
@@ -242,10 +595,12 @@ export default {
     }
     .table-wrapper {
       overflow-x: auto;
+      overflow-y: visible;
     }
     table {
       width: 100%;
       border-collapse: collapse;
+      position: relative;
     }
     thead th {
       font-size: 12px;
@@ -257,6 +612,7 @@ export default {
       text-align: left;
       border-bottom: 2px solid #e2e8f0;
       background: #f8fafc;
+      position: relative;
     }
     thead th:first-child { border-radius: 10px 0 0 0; }
     thead th:last-child { border-radius: 0 10px 0 0; }
@@ -281,13 +637,9 @@ export default {
       border-radius: 20px;
       font-size: 13px;
       font-weight: 600;
+      background: #ede9fe;
+      color: #5b21b6;
     }
-    .theme-bug { background: #fee2e2; color: #991b1b; }
-    .theme-performance { background: #fef3c7; color: #92400e; }
-    .theme-pricing { background: #dbeafe; color: #1e40af; }
-    .theme-onboarding { background: #d1fae5; color: #065f46; }
-    .theme-feature { background: #ede9fe; color: #5b21b6; }
-    .theme-uncategorized { background: #f1f5f9; color: #475569; }
     .right { text-align: right; }
     .number {
       font-weight: 600;
@@ -297,57 +649,172 @@ export default {
       color: #059669;
       font-weight: 700;
     }
+    .sources {
+      font-size: 13px;
+      color: #64748b;
+    }
+    .row-select {
+      padding: 6px 8px;
+      font-size: 13px;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      background: #fff;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      min-width: 90px;
+    }
+    .row-select:hover {
+      border-color: #cbd5e1;
+      background: #f8fafc;
+    }
+    .row-select:focus {
+      outline: none;
+      border-color: #667eea;
+      box-shadow: 0 0 0 3px rgba(102,126,234,0.1);
+    }
+    .rice-score {
+      color: #7c3aed;
+      font-weight: 700;
+      font-size: 16px;
+    }
+    .expand-btn {
+      padding: 2px 8px;
+      font-size: 14px;
+      font-weight: 700;
+      border: 1px solid #cbd5e1;
+      border-radius: 4px;
+      background: #fff;
+      color: #475569;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      margin-right: 8px;
+    }
+    .expand-btn:hover {
+      background: #f1f5f9;
+      border-color: #94a3b8;
+    }
+    .detail-row {
+      background: #f8fafc;
+    }
+    .detail-row:hover {
+      background: #f1f5f9;
+    }
+    .detail-cell {
+      padding: 12px 12px;
+      font-size: 13px;
+      color: #64748b;
+      border-bottom: 1px solid #e2e8f0;
+    }
+    .detail-feedback {
+      font-style: italic;
+      padding-left: 28px;
+      max-width: 600px;
+      line-height: 1.5;
+    }
+    .detail-source {
+      font-weight: 600;
+      color: #475569;
+    }
+    .detail-impact {
+      font-weight: 600;
+      color: #059669;
+    }
+    .tooltip {
+      display: inline-block;
+      margin-left: 6px;
+      width: 16px;
+      height: 16px;
+      line-height: 16px;
+      text-align: center;
+      border-radius: 50%;
+      background: #cbd5e1;
+      color: #475569;
+      font-size: 11px;
+      font-weight: 700;
+      cursor: pointer;
+      user-select: none;
+    }
+    .tooltip:hover {
+      background: #94a3b8;
+    }
+    .tooltip.active {
+      background: #667eea;
+      color: #fff;
+    }
+    #tooltipPopup {
+      display: none;
+      position: fixed;
+      width: 320px;
+      background-color: #1e293b;
+      color: #fff;
+      text-align: left;
+      border-radius: 12px;
+      padding: 16px;
+      z-index: 10000;
+      font-size: 13px;
+      font-weight: 400;
+      line-height: 1.6;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.4);
+      white-space: normal;
+      pointer-events: auto;
+    }
+    #tooltipPopup.visible {
+      display: block;
+    }
+    #tooltipPopup::before {
+      content: "";
+      position: absolute;
+      width: 12px;
+      height: 12px;
+      background-color: #1e293b;
+      transform: rotate(45deg);
+    }
+    #tooltipPopup.below::before {
+      top: -6px;
+      left: 50%;
+      margin-left: -6px;
+    }
+    #tooltipPopup.above::before {
+      bottom: -6px;
+      left: 50%;
+      margin-left: -6px;
+    }
     .empty-state {
       text-align: center;
       padding: 48px 24px;
       color: #94a3b8;
     }
-    .empty-state svg {
-      width: 64px;
-      height: 64px;
-      margin-bottom: 16px;
-      opacity: 0.5;
-    }
     .empty-state p {
       margin: 0;
       font-size: 15px;
-    }
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.6; }
-    }
-    .loading-indicator {
-      animation: pulse 1.5s ease-in-out infinite;
     }
   </style>
 </head>
 <body>
   <div class="container">
     <div class="header">
-      <h1>Feedback Consolidation</h1>
-      <p>Classify and analyze customer feedback with AI-powered insights</p>
+      <h1>RICE Prioritization for Product Managers</h1>
+      <p>AI-powered feedback aggregation with RICE scoring framework</p>
     </div>
 
     <div class="card">
       <div class="controls">
         <div class="input-group">
           <label>Start Date</label>
-          <input id="start" type="date" value="2026-01-10" />
+          <input id="start" type="date" value="2026-01-01" />
         </div>
         <div class="input-group">
           <label>End Date</label>
-          <input id="end" type="date" value="2026-01-14" />
+          <input id="end" type="date" value="2026-01-16" />
         </div>
         <div class="btn-group">
-          <button id="refresh" class="btn-secondary">
-            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M4 4v5h5M20 20v-5h-5"/><path d="M20.49 9A9 9 0 0 0 5.64 5.64L4 7m16 10l-1.64 1.36A9 9 0 0 1 3.51 15"/></svg>
-            Load Table
-          </button>
           <button id="process" class="btn-primary">
-            <svg width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 10 10"/><path d="M12 6v6l4 2"/></svg>
             Process with AI
           </button>
         </div>
+      </div>
+      <div class="last-processed" id="lastProcessed">
+        Last processed: <span id="lastProcessedTime">Not yet</span>
       </div>
       <div class="status" id="status"></div>
     </div>
@@ -357,16 +824,39 @@ export default {
         <table>
           <thead>
             <tr>
-              <th>Theme</th>
-              <th class="right">Items</th>
-              <th class="right">Reach</th>
-              <th class="right">Impact (USD)</th>
+              <th>
+                Aggregated Feedback
+                <span class="tooltip" data-tip="AI-generated aggregation of feedbacks summarizing multiple related feedback items">?</span>
+              </th>
+              <th class="right">
+                Reach
+                <span class="tooltip" data-tip="Number of distinct feedback events in this aggregated line within the selected date range">?</span>
+              </th>
+              <th class="right">
+                Impact
+                <span class="tooltip" data-tip="Sum of contract values tied to distinct feedbacks in this aggregated line (weights: 5=$100K+, 4=$50–99K, 3=$10–49K, 2=$2.5–9K, 1=<$2.5K) within the selected date range">?</span>
+              </th>
+              <th>
+                Sources
+                <span class="tooltip" data-tip="Breakdown of feedback by source: CS (customer support), GitHub, X (Twitter), Discord, Email">?</span>
+              </th>
+              <th>
+                Confidence
+                <span class="tooltip" data-tip="How confident are you this is truly a priority now? (50%, 80%, or 100%)">?</span>
+              </th>
+              <th>
+                Effort
+                <span class="tooltip" data-tip="Estimated effort of handling this aggregated feedback on a scale of 1 (least effort) to 5 (most effort)">?</span>
+              </th>
+              <th class="right">
+                RICE Score
+                <span class="tooltip" data-tip="Priority score = (Reach × Impact × Confidence) / Effort. Higher scores = higher priority.">?</span>
+              </th>
             </tr>
           </thead>
           <tbody id="tbody">
-            <tr><td colspan="4">
+            <tr><td colspan="7">
               <div class="empty-state">
-                <svg fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M3.75 12h16.5m-16.5 3.75h16.5M3.75 19.5h16.5M5.625 4.5h12.75a1.875 1.875 0 0 1 0 3.75H5.625a1.875 1.875 0 0 1 0-3.75Z"/></svg>
                 <p>Loading feedback data...</p>
               </div>
             </td></tr>
@@ -376,21 +866,13 @@ export default {
     </div>
   </div>
 
+  <div id="tooltipPopup"></div>
+
 <script>
   const $ = (id) => document.getElementById(id);
 
   function fmtMoney(n){
     return (Number(n)||0).toLocaleString(undefined,{style:'currency',currency:'USD',maximumFractionDigits:0});
-  }
-
-  function getThemeClass(theme){
-    const t = theme.toLowerCase();
-    if(t.includes('bug')) return 'theme-bug';
-    if(t.includes('performance')) return 'theme-performance';
-    if(t.includes('pricing')) return 'theme-pricing';
-    if(t.includes('onboarding')) return 'theme-onboarding';
-    if(t.includes('feature')) return 'theme-feature';
-    return 'theme-uncategorized';
   }
 
   function setStatus(msg, type){
@@ -399,34 +881,195 @@ export default {
     el.className = 'status visible ' + type;
   }
 
-  async function loadTable(){
-    const start = $('start').value;
-    const end = $('end').value;
-    setStatus('Loading feedback data...', 'loading');
+  function formatTimeAgo(isoString) {
+    if (!isoString) return 'Not yet';
 
-    const res = await fetch('/api/table?start=' + start + '&end=' + end);
+    const date = new Date(isoString);
+    const now = new Date();
+    const diffMs = now - date;
+    const diffMins = Math.floor(diffMs / 60000);
+    const diffHours = Math.floor(diffMs / 3600000);
+    const diffDays = Math.floor(diffMs / 86400000);
+
+    if (diffMins < 1) return 'Just now';
+    if (diffMins === 1) return '1 minute ago';
+    if (diffMins < 60) return diffMins + ' minutes ago';
+    if (diffHours === 1) return '1 hour ago';
+    if (diffHours < 24) return diffHours + ' hours ago';
+    if (diffDays === 1) return '1 day ago';
+    return diffDays + ' days ago';
+  }
+
+  async function updateStatus() {
+    const res = await fetch('/api/status');
     const data = await res.json();
+    $('lastProcessedTime').textContent = formatTimeAgo(data.last_processed);
+  }
 
-    setStatus('Loaded ' + data.total_items + ' feedback items from ' + data.start + ' to ' + data.end, 'success');
+  let cachedData = null; // Store data for re-sorting without fetching
+  let rowSettings = {}; // Store per-row confidence/effort settings
 
-    const rows = data.table || [];
+  function calculateRICE(reach, impact, confidence, effort) {
+    return (reach * impact * confidence) / effort;
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  function toggleDetails(aggregateId, button) {
+    const detailRows = document.querySelectorAll('.detail-row[data-aggregate-id="' + aggregateId + '"]');
+    const isExpanded = button.textContent === '-';
+
+    detailRows.forEach(row => {
+      row.style.display = isExpanded ? 'none' : 'table-row';
+    });
+
+    button.textContent = isExpanded ? '+' : '-';
+  }
+
+  function updateRICEScore(aggregateId) {
+    const confidenceSelect = document.querySelector('select[data-id="' + aggregateId + '"][data-type="confidence"]');
+    const effortSelect = document.querySelector('select[data-id="' + aggregateId + '"][data-type="effort"]');
+    const riceCell = document.querySelector('td[data-rice-id="' + aggregateId + '"]');
+
+    if (!confidenceSelect || !effortSelect || !riceCell) return;
+
+    const confidence = parseFloat(confidenceSelect.value);
+    const effort = parseFloat(effortSelect.value);
+
+    // Store settings
+    rowSettings[aggregateId] = { confidence, effort };
+
+    // Find the row data
+    const row = cachedData.table.find(r => r.aggregate_id === aggregateId);
+    if (!row) return;
+
+    const rice = calculateRICE(row.reach_total, row.impact_score, confidence, effort);
+    riceCell.textContent = rice.toFixed(1);
+
+    // Re-sort table
+    renderTable();
+  }
+
+  function renderTable() {
+    if (!cachedData) return;
+
+    const rows = cachedData.table || [];
     const tbody = $('tbody');
     tbody.innerHTML = '';
 
     if(rows.length === 0){
-      tbody.innerHTML = '<tr><td colspan="4"><div class="empty-state"><svg fill="none" stroke="currentColor" stroke-width="1.5" viewBox="0 0 24 24"><path d="M12 9v3.75m9-.75a9 9 0 1 1-18 0 9 9 0 0 1 18 0Zm-9 3.75h.008v.008H12v-.008Z"/></svg><p>No actionable items yet. Click "Process with AI" to classify feedback.</p></div></td></tr>';
+      tbody.innerHTML = '<tr><td colspan="7"><div class="empty-state"><p>No processed data yet. Click "Process with AI" to classify feedback.</p></div></td></tr>';
       return;
     }
 
-    for(const r of rows){
+    // Calculate RICE for each row and sort
+    const rowsWithRICE = rows
+      .filter(r => r.reach_total > 0)
+      .map(r => {
+        const settings = rowSettings[r.aggregate_id] || { confidence: 1.0, effort: 1 };
+        return {
+          ...r,
+          confidence: settings.confidence,
+          effort: settings.effort,
+          rice_score: calculateRICE(r.reach_total, r.impact_score, settings.confidence, settings.effort)
+        };
+      })
+      .sort((a, b) => b.rice_score - a.rice_score);
+
+    for(const r of rowsWithRICE){
+      // Format source badges
+      const sourcesList = Object.entries(r.reach_by_source || {})
+        .map(([source, count]) => source + ' (' + count + ')')
+        .join(', ');
+
       const tr = document.createElement('tr');
+      tr.className = 'aggregate-row';
+      tr.dataset.aggregateId = r.aggregate_id;
       tr.innerHTML =
-        '<td><span class="theme-badge ' + getThemeClass(r.theme) + '">' + r.theme + '</span></td>' +
-        '<td class="right number">' + r.items + '</td>' +
-        '<td class="right number">' + r.reach.toLocaleString() + '</td>' +
-        '<td class="right number impact">' + fmtMoney(r.impact_usd) + '</td>';
+        '<td>' +
+          '<button class="expand-btn" data-aggregate-id="' + r.aggregate_id + '">+</button> ' +
+          '<span class="theme-badge">' + r.aggregate_text + '</span>' +
+        '</td>' +
+        '<td class="right number">' + r.reach_total + '</td>' +
+        '<td class="right number impact">' + r.impact_score.toFixed(1) + '</td>' +
+        '<td class="sources">' + (sourcesList || 'N/A') + '</td>' +
+        '<td><select class="row-select" data-id="' + r.aggregate_id + '" data-type="confidence">' +
+          '<option value="0.5"' + (r.confidence === 0.5 ? ' selected' : '') + '>50%</option>' +
+          '<option value="0.8"' + (r.confidence === 0.8 ? ' selected' : '') + '>80%</option>' +
+          '<option value="1.0"' + (r.confidence === 1.0 ? ' selected' : '') + '>100%</option>' +
+        '</select></td>' +
+        '<td><select class="row-select" data-id="' + r.aggregate_id + '" data-type="effort">' +
+          '<option value="1"' + (r.effort === 1 ? ' selected' : '') + '>1</option>' +
+          '<option value="2"' + (r.effort === 2 ? ' selected' : '') + '>2</option>' +
+          '<option value="3"' + (r.effort === 3 ? ' selected' : '') + '>3</option>' +
+          '<option value="4"' + (r.effort === 4 ? ' selected' : '') + '>4</option>' +
+          '<option value="5"' + (r.effort === 5 ? ' selected' : '') + '>5</option>' +
+        '</select></td>' +
+        '<td class="right number rice-score" data-rice-id="' + r.aggregate_id + '">' + r.rice_score.toFixed(1) + '</td>';
       tbody.appendChild(tr);
+
+      // Create detail rows for distinct feedbacks (initially hidden)
+      if (r.distinct_feedbacks && r.distinct_feedbacks.length > 0) {
+        for (const feedback of r.distinct_feedbacks) {
+          const detailTr = document.createElement('tr');
+          detailTr.className = 'detail-row';
+          detailTr.dataset.aggregateId = r.aggregate_id;
+          detailTr.style.display = 'none';
+
+          const contractValueFormatted = feedback.contract_value
+            ? fmtMoney(feedback.contract_value)
+            : '$0';
+
+          detailTr.innerHTML =
+            '<td class="detail-cell" colspan="1">' +
+              '<div class="detail-feedback">' + escapeHtml(feedback.text) + '</div>' +
+            '</td>' +
+            '<td class="right detail-cell"></td>' +
+            '<td class="right detail-cell detail-impact">' + contractValueFormatted + '</td>' +
+            '<td class="detail-cell detail-source">' + feedback.source + '</td>' +
+            '<td class="detail-cell"></td>' +
+            '<td class="detail-cell"></td>' +
+            '<td class="detail-cell"></td>';
+          tbody.appendChild(detailTr);
+        }
+      }
     }
+
+    // Add expand/collapse event listeners
+    document.querySelectorAll('.expand-btn').forEach(btn => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const aggregateId = e.target.dataset.aggregateId;
+        toggleDetails(aggregateId, e.target);
+      });
+    });
+
+    // Add event listeners to all dropdowns
+    document.querySelectorAll('.row-select').forEach(select => {
+      select.addEventListener('change', (e) => {
+        const id = parseInt(e.target.dataset.id);
+        updateRICEScore(id);
+      });
+    });
+
+    // Show excluded count if available
+    if (cachedData.excluded_count > 0) {
+      setStatus('Showing ' + rowsWithRICE.length + ' aggregated feedbacks. ' + cachedData.excluded_count + ' distinct feedback items excluded as noise.', 'success');
+    }
+  }
+
+  async function loadTable(){
+    const start = $('start').value;
+    const end = $('end').value;
+
+    const res = await fetch('/api/table?start=' + start + '&end=' + end);
+    cachedData = await res.json();
+
+    renderTable();
   }
 
   async function processAI(){
@@ -442,23 +1085,123 @@ export default {
     });
     const data = await res.json();
 
-    setStatus('Processed ' + data.processed + ' items (' + data.excluded + ' excluded as noise). Refreshing...', 'success');
+    const msg = 'Processed ' + data.processed + ' items\\n' +
+                'Excluded as noise: ' + data.excluded + '\\n' +
+                'Aggregated feedbacks updated: ' + data.new_themes + ' new, ' + data.matched_themes + ' matched';
+
+    setStatus(msg, 'success');
     $('process').disabled = false;
 
+    // Wait 3 seconds before updating the table so user can see the results
+    await new Promise(resolve => setTimeout(resolve, 3000));
+
+    await updateStatus();
     await loadTable();
   }
 
-  $('refresh').addEventListener('click', loadTable);
   $('process').addEventListener('click', processAI);
 
-  // auto-load on first open
+  // Tooltip handling
+  const tooltipPopup = $('tooltipPopup');
+  let currentTooltip = null;
+
+  function showTooltip(element, text) {
+    const rect = element.getBoundingClientRect();
+    const popupWidth = 320;
+    const popupHeight = 100; // Approximate height
+    const spacing = 12;
+
+    // Remove active class from previous tooltip
+    if (currentTooltip) {
+      currentTooltip.classList.remove('active');
+    }
+
+    // Add active class to current tooltip
+    element.classList.add('active');
+    currentTooltip = element;
+
+    // Set content
+    tooltipPopup.textContent = text;
+    tooltipPopup.classList.add('visible');
+
+    // Calculate position - prefer below, but show above if not enough space
+    const spaceBelow = window.innerHeight - rect.bottom;
+    const spaceAbove = rect.top;
+
+    let top, left;
+    if (spaceBelow >= popupHeight + spacing) {
+      // Show below
+      top = rect.bottom + spacing;
+      tooltipPopup.classList.remove('above');
+      tooltipPopup.classList.add('below');
+    } else if (spaceAbove >= popupHeight + spacing) {
+      // Show above
+      top = rect.top - popupHeight - spacing;
+      tooltipPopup.classList.remove('below');
+      tooltipPopup.classList.add('above');
+    } else {
+      // Not enough space either way, show below anyway
+      top = rect.bottom + spacing;
+      tooltipPopup.classList.remove('above');
+      tooltipPopup.classList.add('below');
+    }
+
+    // Center horizontally relative to the tooltip icon
+    left = rect.left + (rect.width / 2) - (popupWidth / 2);
+
+    // Keep within viewport bounds
+    const padding = 16;
+    if (left < padding) left = padding;
+    if (left + popupWidth > window.innerWidth - padding) {
+      left = window.innerWidth - popupWidth - padding;
+    }
+
+    tooltipPopup.style.top = top + 'px';
+    tooltipPopup.style.left = left + 'px';
+  }
+
+  function hideTooltip() {
+    tooltipPopup.classList.remove('visible');
+    if (currentTooltip) {
+      currentTooltip.classList.remove('active');
+      currentTooltip = null;
+    }
+  }
+
+  // Event delegation for tooltip clicks
+  document.addEventListener('click', (e) => {
+    const tooltip = e.target.closest('.tooltip');
+    if (tooltip) {
+      e.stopPropagation();
+      const text = tooltip.getAttribute('data-tip');
+      if (currentTooltip === tooltip) {
+        // Clicking the same tooltip again closes it
+        hideTooltip();
+      } else {
+        showTooltip(tooltip, text);
+      }
+    } else {
+      // Click outside closes tooltip
+      hideTooltip();
+    }
+  });
+
+  // Close tooltip on escape key
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      hideTooltip();
+    }
+  });
+
+  // Initial load
+  updateStatus();
   loadTable();
 </script>
 </body>
 </html>`;
 
     return new Response(html, {
-      headers: { "content-type": "text/html; charset=utf-8" },
+      headers: { "content-type": "text/html; charset=utf-8" }
     });
-  },
+  }
 };
