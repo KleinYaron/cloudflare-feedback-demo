@@ -411,7 +411,7 @@ invocation_logs = true
 
 ## 📄 License
 
-This project is part of a coursework demonstration for AI-powered feedback aggregation systems.
+This project is part of a Cloudflare PM home assignment demonstration for AI-powered feedback aggregation systems.
 
 ## 🙏 Acknowledgments
 
