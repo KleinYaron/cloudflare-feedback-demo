@@ -32,11 +32,44 @@ Return ONLY "1" for actionable or "0" for noise. No explanation.`
 }
 
 async function classifyAggregatedFeedback(env, feedbackText, existingAggregatedFeedbacks) {
+  // First, try semantic similarity search using Vectorize
+  let similarAggregatedFeedbacks = [];
+
+  if (existingAggregatedFeedbacks.length > 0) {
+    // Generate embedding for the feedback text
+    const embeddingResponse = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+      text: feedbackText
+    });
+
+    const feedbackEmbedding = embeddingResponse.data[0];
+
+    // Search for similar aggregated feedbacks in Vectorize
+    const vectorResults = await env.VECTORIZE.query(feedbackEmbedding, {
+      topK: 5,
+      returnMetadata: true
+    });
+
+    // Filter aggregated feedbacks with similarity > 0.85 (very similar)
+    similarAggregatedFeedbacks = vectorResults.matches
+      .filter(match => match.score > 0.85)
+      .map(match => ({
+        aggregate_id: match.id,
+        aggregate_text: match.metadata.text,
+        similarity: match.score
+      }));
+  }
+
   const aggregatedListText = existingAggregatedFeedbacks.length > 0
     ? existingAggregatedFeedbacks.map(af =>
         `ID: ${af.aggregate_id} | Aggregated Feedback: "${af.aggregate_text}"`
       ).join('\n')
     : 'No existing aggregated feedbacks yet.';
+
+  // Prepare similar aggregated feedbacks hint for AI
+  const similarAggregatedFeedbacksHint = similarAggregatedFeedbacks.length > 0
+    ? `\n\nSEMANTICALLY SIMILAR AGGREGATED FEEDBACKS (use these if they match):\n` +
+      similarAggregatedFeedbacks.map(af => `ID: ${af.aggregate_id} | "${af.aggregate_text}" (similarity: ${(af.similarity * 100).toFixed(1)}%)`).join('\n')
+    : '';
 
   const response = await env.AI.run('@cf/meta/llama-3.1-8b-instruct', {
     messages: [{
@@ -48,11 +81,11 @@ IMPORTANT: A single feedback can relate to MULTIPLE aggregated feedbacks if it m
 AGGREGATED FEEDBACK should be:
 - A concise statement of the product issue or request (max 12 words)
 - Clear and specific enough for a PM to understand the problem
-- Focused on ONE core issue or theme
+- Focused on ONE core issue
 - Written from the product perspective (e.g., "Export functionality fails with large datasets" not "Users complaining about exports")
 
 EXISTING AGGREGATED FEEDBACKS:
-${aggregatedListText}
+${aggregatedListText}${similarAggregatedFeedbacksHint}
 
 YOUR TASK:
 1. Read the new feedback carefully
@@ -178,7 +211,7 @@ export default {
       const start = url.searchParams.get("start") || "2026-01-01";
       const end = url.searchParams.get("end") || "2026-01-16";
 
-      // Get aggregated themes with their matched feedback (filtered by timeframe and actionable)
+      // Get aggregated feedbacks with their matched feedback (filtered by timeframe and actionable)
       // Also calculate impact score based on contract value tiers
       const aggregates = await env.db_binding
         .prepare(
@@ -307,9 +340,13 @@ export default {
 
     // API: Process with AI
     if (url.pathname === "/api/process" && request.method === "POST") {
+      console.log('[PROCESS] Starting AI processing');
       const body = await request.json().catch(() => ({}));
       const start = body.start || "2026-01-01";
       const end = body.end || "2026-01-16";
+      const batchSize = body.batch_size || 10; // Process max 10 items per request to avoid timeout
+
+      console.log(`[PROCESS] Date range: ${start} to ${end}, batch size: ${batchSize}`);
 
       // Check if there are any new feedbacks first
       const countResult = await env.db_binding
@@ -322,32 +359,37 @@ export default {
         .bind(start, end + 'T23:59:59Z')
         .first();
 
+      console.log(`[PROCESS] Found ${countResult.count} unprocessed feedbacks`);
+
       if (countResult.count === 0) {
         return new Response(JSON.stringify({
           start,
           end,
           processed: 0,
           excluded: 0,
-          new_themes: 0,
-          matched_themes: 0,
+          new_aggregated_feedbacks: 0,
+          matched_aggregated_feedbacks: 0,
           message: 'No new feedbacks to process'
         }), {
           headers: { "content-type": "application/json; charset=utf-8" }
         });
       }
 
-      // Get unprocessed feedback
+      // Get unprocessed feedback (limited by batch size)
       const rows = await env.db_binding
         .prepare(
           `SELECT id, text
            FROM feedback_events
            WHERE timestamp >= ? AND timestamp <= ?
-           AND is_actionable IS NULL`
+           AND is_actionable IS NULL
+           LIMIT ?`
         )
-        .bind(start, end + 'T23:59:59Z')
+        .bind(start, end + 'T23:59:59Z', batchSize)
         .all();
 
       const items = rows.results || [];
+      console.log(`[PROCESS] Processing batch of ${items.length} items`);
+
       let processed = 0;
       let excluded = 0;
       let newAggregatedFeedbacks = 0;
@@ -358,17 +400,23 @@ export default {
         .prepare(`SELECT aggregate_id, aggregate_text FROM feedback_aggregated`)
         .all();
 
+      console.log(`[PROCESS] Found ${existingAggregatedFeedbacks.results?.length || 0} existing aggregated feedbacks`);
+
       const aggregatedFeedbackMap = new Map();
       for (const af of existingAggregatedFeedbacks.results || []) {
         aggregatedFeedbackMap.set(af.aggregate_text.toLowerCase(), af.aggregate_id);
       }
 
       // Process each feedback item
-      for (const item of items) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        console.log(`[PROCESS] Processing feedback ${i + 1}/${items.length} (ID: ${item.id})`);
         const text = String(item.text || "");
 
         // STEP A: Determine if actionable using AI
+        console.log(`[PROCESS] Classifying actionability for feedback ${item.id}`);
         const is_actionable = await classifyActionable(env, text);
+        console.log(`[PROCESS] Feedback ${item.id} is_actionable: ${is_actionable}`);
 
         if (is_actionable === 0) {
           excluded += 1;
@@ -382,11 +430,13 @@ export default {
 
         // STEP B: Classify into aggregated feedback(s) - can be multiple!
         if (is_actionable === 1) {
+          console.log(`[PROCESS] Classifying aggregated feedback for feedback ${item.id}`);
           const classifications = await classifyAggregatedFeedback(
             env,
             text,
             existingAggregatedFeedbacks.results || []
           );
+          console.log(`[PROCESS] Got ${classifications.length} classifications for feedback ${item.id}`);
 
           // Process EACH classification (many-to-many support)
           for (const classification of classifications) {
@@ -399,9 +449,11 @@ export default {
               );
 
               if (existingMatch) {
+                console.log(`[PROCESS] Matched existing aggregated feedback: "${classification.aggregatedText}"`);
                 aggregateId = existingMatch;
                 matchedAggregatedFeedbacks += 1;
               } else {
+                console.log(`[PROCESS] Creating new aggregated feedback: "${classification.aggregatedText}"`);
                 // Create new aggregated feedback
                 const insertResult = await env.db_binding
                   .prepare(`INSERT INTO feedback_aggregated (aggregate_text) VALUES (?)`)
@@ -409,7 +461,26 @@ export default {
                   .run();
 
                 aggregateId = insertResult.meta.last_row_id;
+                console.log(`[PROCESS] Created new aggregated feedback with ID: ${aggregateId}`);
                 aggregatedFeedbackMap.set(classification.aggregatedText.toLowerCase(), aggregateId);
+
+                // Generate and store embedding in Vectorize for semantic search
+                console.log(`[PROCESS] Generating embedding for aggregated feedback ${aggregateId}`);
+                const embeddingResponse = await env.AI.run('@cf/baai/bge-base-en-v1.5', {
+                  text: classification.aggregatedText
+                });
+
+                const embedding = embeddingResponse.data[0];
+
+                console.log(`[PROCESS] Storing embedding in Vectorize for aggregated feedback ${aggregateId}`);
+                await env.VECTORIZE.upsert([{
+                  id: String(aggregateId),
+                  values: embedding,
+                  metadata: {
+                    text: classification.aggregatedText,
+                    created_at: new Date().toISOString()
+                  }
+                }]);
 
                 // Add to existing list for subsequent classifications
                 existingAggregatedFeedbacks.results.push({
@@ -420,11 +491,23 @@ export default {
                 newAggregatedFeedbacks += 1;
               }
             } else {
-              aggregateId = classification.aggregateId;
-              matchedAggregatedFeedbacks += 1;
+              // Validate that the aggregate_id exists
+              const validId = existingAggregatedFeedbacks.results.find(
+                af => af.aggregate_id === classification.aggregateId
+              );
+
+              if (validId) {
+                console.log(`[PROCESS] Using existing aggregated feedback ID: ${classification.aggregateId}`);
+                aggregateId = classification.aggregateId;
+                matchedAggregatedFeedbacks += 1;
+              } else {
+                console.log(`[PROCESS] AI returned invalid aggregated feedback ID ${classification.aggregateId} - skipping this classification`);
+                continue; // Skip this invalid classification
+              }
             }
 
             // Create match in feedback_match table (many-to-many!)
+            console.log(`[PROCESS] Creating match: feedback ${item.id} -> aggregated feedback ${aggregateId}`);
             await env.db_binding
               .prepare(`INSERT OR IGNORE INTO feedback_match (aggregate_id, feedback_id) VALUES (?, ?)`)
               .bind(aggregateId, item.id)
@@ -435,13 +518,26 @@ export default {
         }
       }
 
+      console.log(`[PROCESS] Batch complete. Processed: ${processed}, Excluded: ${excluded}, New aggregated feedbacks: ${newAggregatedFeedbacks}, Matched aggregated feedbacks: ${matchedAggregatedFeedbacks}`);
+
+      const remainingCount = countResult.count - items.length;
+      const message = remainingCount > 0
+        ? `Processed ${items.length} items. ${remainingCount} items remaining. Click "Process with AI" again to continue.`
+        : 'All feedbacks processed successfully!';
+
+      // Store last processing time
+      const processingTime = new Date().toISOString();
+
       return new Response(JSON.stringify({
         start,
         end,
         processed,
         excluded,
-        new_themes: newAggregatedFeedbacks,
-        matched_themes: matchedAggregatedFeedbacks
+        new_aggregated_feedbacks: newAggregatedFeedbacks,
+        matched_aggregated_feedbacks: matchedAggregatedFeedbacks,
+        remaining: remainingCount,
+        message,
+        last_processed: processingTime
       }, null, 2), {
         headers: { "content-type": "application/json; charset=utf-8" }
       });
@@ -613,8 +709,12 @@ export default {
       border-bottom: 2px solid #e2e8f0;
       background: #f8fafc;
       position: relative;
+      white-space: nowrap;
     }
-    thead th:first-child { border-radius: 10px 0 0 0; }
+    thead th:first-child {
+      border-radius: 10px 0 0 0;
+      width: 40%;
+    }
     thead th:last-child { border-radius: 0 10px 0 0; }
     tbody tr {
       transition: background 0.15s ease;
@@ -627,11 +727,15 @@ export default {
       border-bottom: 1px solid #f1f5f9;
       color: #334155;
       font-size: 15px;
+      vertical-align: middle;
+    }
+    tbody td:first-child {
+      width: 40%;
     }
     tbody tr:last-child td {
       border-bottom: none;
     }
-    .theme-badge {
+    .aggregated-feedback-badge {
       display: inline-block;
       padding: 6px 14px;
       border-radius: 20px;
@@ -639,6 +743,7 @@ export default {
       font-weight: 600;
       background: #ede9fe;
       color: #5b21b6;
+      vertical-align: middle;
     }
     .right { text-align: right; }
     .number {
@@ -688,6 +793,11 @@ export default {
       cursor: pointer;
       transition: all 0.2s ease;
       margin-right: 8px;
+      vertical-align: middle;
+      min-width: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
     }
     .expand-btn:hover {
       background: #f1f5f9;
@@ -720,12 +830,11 @@ export default {
       color: #059669;
     }
     .tooltip {
-      display: inline-block;
-      margin-left: 6px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       width: 16px;
       height: 16px;
-      line-height: 16px;
-      text-align: center;
       border-radius: 50%;
       background: #cbd5e1;
       color: #475569;
@@ -733,6 +842,8 @@ export default {
       font-weight: 700;
       cursor: pointer;
       user-select: none;
+      vertical-align: middle;
+      flex-shrink: 0;
     }
     .tooltip:hover {
       background: #94a3b8;
@@ -788,6 +899,65 @@ export default {
       margin: 0;
       font-size: 15px;
     }
+    .progress-container {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 20px;
+      padding: 32px 24px;
+    }
+    .progress-dots {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+    }
+    .progress-dot {
+      width: 16px;
+      height: 16px;
+      border-radius: 50%;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      animation: dotPulse 1.4s ease-in-out infinite;
+    }
+    .progress-dot:nth-child(2) {
+      animation-delay: 0.2s;
+    }
+    .progress-dot:nth-child(3) {
+      animation-delay: 0.4s;
+    }
+    .progress-dot:nth-child(4) {
+      animation-delay: 0.6s;
+    }
+    .progress-dot:nth-child(5) {
+      animation-delay: 0.8s;
+    }
+    @keyframes dotPulse {
+      0%, 100% {
+        transform: scale(1);
+        opacity: 0.4;
+      }
+      50% {
+        transform: scale(1.3);
+        opacity: 1;
+      }
+    }
+    .progress-text {
+      font-size: 15px;
+      color: #475569;
+      font-weight: 500;
+    }
+    .progress-subtext {
+      font-size: 13px;
+      color: #94a3b8;
+      margin-top: 4px;
+    }
+    .th-content {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .right .th-content {
+      justify-content: flex-end;
+    }
   </style>
 </head>
 <body>
@@ -825,32 +995,46 @@ export default {
           <thead>
             <tr>
               <th>
-                Aggregated Feedback
-                <span class="tooltip" data-tip="AI-generated aggregation of feedbacks summarizing multiple related feedback items">?</span>
+                <span class="th-content">
+                  <span>Aggregated Feedback</span>
+                  <span class="tooltip" data-tip="AI-generated aggregation of feedbacks summarizing multiple related feedback items">?</span>
+                </span>
               </th>
               <th class="right">
-                Reach
-                <span class="tooltip" data-tip="Number of distinct feedback events in this aggregated line within the selected date range">?</span>
+                <span class="th-content">
+                  <span>Reach</span>
+                  <span class="tooltip" data-tip="Number of distinct feedback events in this aggregated line within the selected date range">?</span>
+                </span>
               </th>
               <th class="right">
-                Impact
-                <span class="tooltip" data-tip="Sum of contract values tied to distinct feedbacks in this aggregated line (weights: 5=$100K+, 4=$50–99K, 3=$10–49K, 2=$2.5–9K, 1=<$2.5K) within the selected date range">?</span>
+                <span class="th-content">
+                  <span>Impact</span>
+                  <span class="tooltip" data-tip="Sum of contract values tied to distinct feedbacks in this aggregated line (weights: 5=$100K+, 4=$50–99K, 3=$10–49K, 2=$2.5–9K, 1=<$2.5K) within the selected date range">?</span>
+                </span>
               </th>
               <th>
-                Sources
-                <span class="tooltip" data-tip="Breakdown of feedback by source: CS (customer support), GitHub, X (Twitter), Discord, Email">?</span>
+                <span class="th-content">
+                  <span>Sources</span>
+                  <span class="tooltip" data-tip="Breakdown of feedback by source: CS (customer support), GitHub, X (Twitter), Discord, Email">?</span>
+                </span>
               </th>
               <th>
-                Confidence
-                <span class="tooltip" data-tip="How confident are you this is truly a priority now? (50%, 80%, or 100%)">?</span>
+                <span class="th-content">
+                  <span>Confidence</span>
+                  <span class="tooltip" data-tip="How confident are you this is truly a priority now? (50%, 80%, or 100%)">?</span>
+                </span>
               </th>
               <th>
-                Effort
-                <span class="tooltip" data-tip="Estimated effort of handling this aggregated feedback on a scale of 1 (least effort) to 5 (most effort)">?</span>
+                <span class="th-content">
+                  <span>Effort</span>
+                  <span class="tooltip" data-tip="Estimated effort of handling this aggregated feedback on a scale of 1 (least effort) to 5 (most effort)">?</span>
+                </span>
               </th>
               <th class="right">
-                RICE Score
-                <span class="tooltip" data-tip="Priority score = (Reach × Impact × Confidence) / Effort. Higher scores = higher priority.">?</span>
+                <span class="th-content">
+                  <span>RICE Score</span>
+                  <span class="tooltip" data-tip="Priority score = (Reach × Impact × Confidence) / Effort. Higher scores = higher priority.">?</span>
+                </span>
               </th>
             </tr>
           </thead>
@@ -992,7 +1176,7 @@ export default {
       tr.innerHTML =
         '<td>' +
           '<button class="expand-btn" data-aggregate-id="' + r.aggregate_id + '">+</button> ' +
-          '<span class="theme-badge">' + r.aggregate_text + '</span>' +
+          '<span class="aggregated-feedback-badge">' + r.aggregate_text + '</span>' +
         '</td>' +
         '<td class="right number">' + r.reach_total + '</td>' +
         '<td class="right number impact">' + r.impact_score.toFixed(1) + '</td>' +
@@ -1078,6 +1262,24 @@ export default {
     setStatus('Processing feedback with AI...', 'loading');
     $('process').disabled = true;
 
+    // Show animated progress in the table
+    const tbody = $('tbody');
+    tbody.innerHTML = '<tr><td colspan="7">' +
+      '<div class="progress-container">' +
+        '<div class="progress-dots">' +
+          '<div class="progress-dot"></div>' +
+          '<div class="progress-dot"></div>' +
+          '<div class="progress-dot"></div>' +
+          '<div class="progress-dot"></div>' +
+          '<div class="progress-dot"></div>' +
+        '</div>' +
+        '<div>' +
+          '<div class="progress-text">AI is analyzing your feedback...</div>' +
+          '<div class="progress-subtext">Classifying actionability and aggregating themes</div>' +
+        '</div>' +
+      '</div>' +
+    '</td></tr>';
+
     const res = await fetch('/api/process', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -1087,15 +1289,19 @@ export default {
 
     const msg = 'Processed ' + data.processed + ' items\\n' +
                 'Excluded as noise: ' + data.excluded + '\\n' +
-                'Aggregated feedbacks updated: ' + data.new_themes + ' new, ' + data.matched_themes + ' matched';
+                'Aggregated feedbacks updated: ' + data.new_aggregated_feedbacks + ' new, ' + data.matched_aggregated_feedbacks + ' matched';
 
     setStatus(msg, 'success');
     $('process').disabled = false;
 
-    // Wait 3 seconds before updating the table so user can see the results
-    await new Promise(resolve => setTimeout(resolve, 3000));
+    // Update last processed time immediately
+    if (data.last_processed) {
+      $('lastProcessedTime').textContent = formatTimeAgo(data.last_processed);
+    }
 
-    await updateStatus();
+    // Wait 5 seconds before updating the table so user can see the results
+    await new Promise(resolve => setTimeout(resolve, 5000));
+
     await loadTable();
   }
 

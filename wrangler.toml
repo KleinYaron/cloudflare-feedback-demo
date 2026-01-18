@@ -9,3 +9,14 @@ database_id = "13b27590-9e95-401c-aea4-ee020d0c7f75"
 
 [ai]
 binding = "AI"
+
+[[vectorize]]
+binding = "VECTORIZE"
+index_name = "feedback-themes"
+
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+invocation_logs = true
