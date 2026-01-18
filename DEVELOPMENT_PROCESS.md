@@ -13,43 +13,30 @@ Claude Code is an interactive command-line interface that provides:
 
 ## Key Prompts Used to Build This Solution
 
-### Initial Setup & Architecture
+### Product Design
 ```
-"Can you create an architecture chart so I can send it as part of a [home assignment]?"
+"Help me design a feedback aggregation system that uses the RICE framework 
+(Reach × Impact × Confidence / Effort) to help PMs prioritize what to build. 
+Impact should be derived from customer contract value, not arbitrary scores."
 ```
-- Generated comprehensive Mermaid architecture diagram showing system components
-- Created visual representation of data flow and AI processing pipeline
+### Fixing Errors/Debugging
+```
+"My Worker is timing out when processing AI operations on 30 items. Help me 
+understand why this happens, what the limits are, and what architecture patterns 
+would solve this (Workflows vs batching vs parallel processing)."
 
 ```
-"Can you also create another one that shows the flow chart from the sources:
-CS/Github/X/etc to landing table and then how everything runs? Also you can
-include as mentioning clearly 'step 2' Workflows for enhancement"
+### UX
 ```
-- Created end-to-end data flow diagram
-- Highlighted Cloudflare Workflows as future enhancement for scaling beyond 30-second Worker limits
-
+"Design a modern, professional UI for PMs to review feedback themes. Should feel 
+premium with gradients, smooth animations, and clear data visualization. Make it 
+look like a tool that enterprise teams would pay for."
+```
 ### Documentation
 ```
-"ok please push it all to git. please make sure you push it to cloudflare-feedback-demo
+"ok push it all to git. Make sure you push it to cloudflare-feedback-demo
 and that you populate a detailed README file with all info"
-```
-- Claude generated comprehensive README.md with:
-  - Complete feature list and architecture overview
-  - Step-by-step installation and setup instructions
-  - API endpoint documentation with examples
-  - Database schema and design decisions
-  - Usage examples and troubleshooting guides
 
-### Git & Deployment
-```
-"remove any mention of coursework to Cloudflare PM home assignment and then
-merge directly to main don't need to confirm"
-```
-- Claude autonomously:
-  - Searched codebase for all instances of "coursework"
-  - Replaced with "Cloudflare PM home assignment"
-  - Resolved merge conflicts
-  - Pushed to GitHub main branch
 
 ## Development Approach
 
